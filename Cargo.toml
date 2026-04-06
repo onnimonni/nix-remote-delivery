@@ -1,0 +1,16 @@
+[package]
+name = "nix-remote-delivery"
+version = "0.1.0"
+edition = "2021"
+description = "Deploy NixOS by syncing source to remote servers and building there"
+license = "MIT"
+repository = "https://github.com/onnimonni/nix-remote-delivery"
+
+[[bin]]
+name = "nix-remote-delivery"
+path = "src/main.rs"
+
+[dependencies]
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
