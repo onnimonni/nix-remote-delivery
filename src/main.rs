@@ -56,7 +56,9 @@ struct Config {
     kexec_url: String,
     /// SFTP user@host for binary cache
     cache_url: Option<String>,
-    /// Directory with SSH host keys to inject during install (preserves server identity)
+    /// SSH host keys source: directory path OR sops-encrypted YAML file
+    /// Directory: --host-keys ./keys/ (contains ssh_host_*_key files)
+    /// SOPS file: --host-keys secrets/hosts/server.yaml (decrypted on-the-fly)
     host_keys_dir: Option<String>,
 }
 
@@ -585,6 +587,32 @@ fn sync_via_tar(host: &str, local_dir: &Path, remote_dir: &str, strict_host: boo
     files.iter().filter(|f| local_dir.join(f).is_file()).count() as u32
 }
 
+/// Pipe a tar.gz archive of SSH host keys to /mnt/etc/ssh/ on the remote.
+fn inject_host_keys_archive(host: &str, archive: &[u8]) {
+    let mut args = ssh_base_args(host, false);
+    args.push(
+        "mkdir -p /mnt/etc/ssh && tar xzf - -C /mnt/etc/ssh/ && \
+         chmod 600 /mnt/etc/ssh/ssh_host_*_key 2>/dev/null; \
+         chmod 644 /mnt/etc/ssh/ssh_host_*_key.pub 2>/dev/null; true"
+            .into(),
+    );
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut child = Command::new("ssh")
+        .args(&refs)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| {
+            fail(&format!("ssh failed: {e}"));
+            std::process::exit(1);
+        });
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(archive);
+    }
+    let _ = child.wait();
+}
+
 /// Poll SSH until the host is reachable, with timeout.
 fn wait_for_ssh(host: &str, timeout: Duration) {
     let start = Instant::now();
@@ -998,14 +1026,17 @@ fn cmd_install(cfg: &Config) {
     ok(&format!("installed  {:.1}s", t.elapsed().as_secs_f32()));
 
     // ── inject SSH host keys into installed system ──────────────────────
-    // If --host-keys given: inject those (persistent identity across reinstalls)
-    // Otherwise: copy current installer's host keys (same as nixos-anywhere)
-    if let Some(ref keys_dir) = cfg.host_keys_dir {
-        let keys_path = Path::new(keys_dir);
-        if keys_path.is_dir() {
-            eprint!("  host keys...");
+    // --host-keys <dir>:  inject from directory (plaintext key files)
+    // --host-keys <file>: decrypt SOPS YAML, extract keys, inject
+    // (none):             copy installer's current keys (like nixos-anywhere)
+    if let Some(ref keys_src) = cfg.host_keys_dir {
+        let src_path = Path::new(keys_src);
+        eprint!("  host keys...");
+
+        if src_path.is_dir() {
+            // Directory mode: tar up ssh_host_* files and pipe to server
             let mut key_files: Vec<PathBuf> = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(keys_path) {
+            if let Ok(entries) = std::fs::read_dir(src_path) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.starts_with("ssh_host_") {
@@ -1014,34 +1045,69 @@ fn cmd_install(cfg: &Config) {
                 }
             }
             if !key_files.is_empty() {
-                let archive = create_tar_gz(keys_path, &key_files, v);
-                let mut inject_args = ssh_base_args(&cfg.host, false);
-                inject_args.push("tar xzf - -C /mnt/etc/ssh/ && chmod 600 /mnt/etc/ssh/ssh_host_*_key && chmod 644 /mnt/etc/ssh/ssh_host_*_key.pub".into());
-                let refs: Vec<&str> = inject_args.iter().map(|s| s.as_str()).collect();
-                let mut child = Command::new("ssh")
-                    .args(&refs)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .unwrap_or_else(|e| {
-                        fail(&format!("ssh failed: {e}"));
-                        std::process::exit(1);
-                    });
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&archive);
-                }
-                if child.wait().map_or(false, |s| s.success()) {
-                    ok(&format!("{} host key(s) injected from {keys_dir}", key_files.len()));
-                } else {
-                    warn("host key injection failed");
+                let archive = create_tar_gz(src_path, &key_files, v);
+                inject_host_keys_archive(&cfg.host, &archive);
+                ok(&format!("{} key(s) from {keys_src}", key_files.len()));
+            }
+        } else if src_path.is_file() {
+            // SOPS file mode: decrypt with `sops -d`, extract key fields, inject
+            verbose(v, &format!("decrypting SOPS file: {keys_src}"));
+            let tmpdir = std::env::temp_dir().join("nix-remote-delivery-host-keys");
+            let _ = std::fs::remove_dir_all(&tmpdir);
+            std::fs::create_dir_all(&tmpdir).unwrap();
+
+            // Extract each key field from the SOPS YAML
+            let mut injected = 0;
+            for (field, filename, mode) in [
+                ("ssh_host_ed25519_key", "ssh_host_ed25519_key", "0600"),
+                ("ssh_host_ed25519_key_pub", "ssh_host_ed25519_key.pub", "0644"),
+                ("ssh_host_rsa_key", "ssh_host_rsa_key", "0600"),
+                ("ssh_host_rsa_key_pub", "ssh_host_rsa_key.pub", "0644"),
+            ] {
+                let out = Command::new("sops")
+                    .args(["-d", "--extract", &format!("[\"{field}\"]"), keys_src])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output();
+
+                if let Ok(out) = out {
+                    if out.status.success() && !out.stdout.is_empty() {
+                        let key_path = tmpdir.join(filename);
+                        std::fs::write(&key_path, &out.stdout).unwrap();
+                        // Set local file permissions before tar
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let perms = std::fs::Permissions::from_mode(
+                                u32::from_str_radix(mode, 8).unwrap(),
+                            );
+                            std::fs::set_permissions(&key_path, perms).ok();
+                        }
+                        injected += 1;
+                    }
                 }
             }
+
+            if injected > 0 {
+                let files: Vec<PathBuf> = std::fs::read_dir(&tmpdir)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| PathBuf::from(e.file_name()))
+                    .collect();
+                let archive = create_tar_gz(&tmpdir, &files, v);
+                inject_host_keys_archive(&cfg.host, &archive);
+                ok(&format!("{injected} key(s) from SOPS {keys_src}"));
+            } else {
+                warn("no host keys found in SOPS file");
+            }
+
+            let _ = std::fs::remove_dir_all(&tmpdir);
         } else {
-            warn(&format!("host keys dir not found: {keys_dir}"));
+            warn(&format!("host keys path not found: {keys_src}"));
         }
     } else {
-        // Default: copy installer's current host keys (preserved from rescue by kexec)
+        // Default: copy installer's current host keys (like nixos-anywhere)
         let copy_keys = "cp /etc/ssh/ssh_host_* /mnt/etc/ssh/ 2>/dev/null && \
                           chmod 600 /mnt/etc/ssh/ssh_host_*_key && \
                           chmod 644 /mnt/etc/ssh/ssh_host_*_key.pub";
