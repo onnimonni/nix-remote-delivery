@@ -54,9 +54,10 @@ struct Config {
     force_eval: bool,
     verbose: bool,
     kexec_url: String,
-    /// WebDAV URL for binary cache (e.g. https://user:pass@host/nix-cache)
-    /// nix-remote-delivery starts rclone on-demand — no NixOS config changes needed.
+    /// SFTP user@host for binary cache
     cache_url: Option<String>,
+    /// Directory with SSH host keys to inject during install (preserves server identity)
+    host_keys_dir: Option<String>,
 }
 
 const DEFAULT_KEXEC_URL: &str = "https://github.com/nix-community/nixos-images/releases/download/nixos-unstable/nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz";
@@ -79,6 +80,7 @@ fn usage() {
     eprintln!("    --force-eval          Force eval even if .nix files unchanged");
     eprintln!("    --verbose, -v         Show commands and extra details");
     eprintln!("    --cache <USER@HOST>    SFTP cache via SSHFS (e.g. u123@u123.storagebox.de)");
+    eprintln!("    --host-keys <DIR>     Inject SSH host keys from DIR (install mode, persists identity)");
     eprintln!("    --kexec-url <URL>     Custom kexec tarball URL (install mode only)");
     eprintln!("    -h, --help            Show this help");
 }
@@ -95,6 +97,7 @@ fn parse_args() -> Config {
     let mut verbose = false;
     let mut kexec_url = String::from(DEFAULT_KEXEC_URL);
     let mut cache_url: Option<String> = None;
+    let mut host_keys_dir: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -127,6 +130,12 @@ fn parse_args() -> Config {
                     std::process::exit(1);
                 }));
             }
+            "--host-keys" => {
+                host_keys_dir = Some(args.next().unwrap_or_else(|| {
+                    fail("--host-keys requires a directory path");
+                    std::process::exit(1);
+                }));
+            }
             "--kexec-url" => {
                 kexec_url = args.next().unwrap_or_else(|| {
                     fail("--kexec-url requires a value");
@@ -156,6 +165,7 @@ fn parse_args() -> Config {
         verbose,
         kexec_url,
         cache_url,
+        host_keys_dir,
     }
 }
 
@@ -986,6 +996,61 @@ fn cmd_install(cfg: &Config) {
         std::process::exit(1);
     }
     ok(&format!("installed  {:.1}s", t.elapsed().as_secs_f32()));
+
+    // ── inject SSH host keys into installed system ──────────────────────
+    // If --host-keys given: inject those (persistent identity across reinstalls)
+    // Otherwise: copy current installer's host keys (same as nixos-anywhere)
+    if let Some(ref keys_dir) = cfg.host_keys_dir {
+        let keys_path = Path::new(keys_dir);
+        if keys_path.is_dir() {
+            eprint!("  host keys...");
+            let mut key_files: Vec<PathBuf> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(keys_path) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("ssh_host_") {
+                        key_files.push(PathBuf::from(&name));
+                    }
+                }
+            }
+            if !key_files.is_empty() {
+                let archive = create_tar_gz(keys_path, &key_files, v);
+                let mut inject_args = ssh_base_args(&cfg.host, false);
+                inject_args.push("tar xzf - -C /mnt/etc/ssh/ && chmod 600 /mnt/etc/ssh/ssh_host_*_key && chmod 644 /mnt/etc/ssh/ssh_host_*_key.pub".into());
+                let refs: Vec<&str> = inject_args.iter().map(|s| s.as_str()).collect();
+                let mut child = Command::new("ssh")
+                    .args(&refs)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap_or_else(|e| {
+                        fail(&format!("ssh failed: {e}"));
+                        std::process::exit(1);
+                    });
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(&archive);
+                }
+                if child.wait().map_or(false, |s| s.success()) {
+                    ok(&format!("{} host key(s) injected from {keys_dir}", key_files.len()));
+                } else {
+                    warn("host key injection failed");
+                }
+            }
+        } else {
+            warn(&format!("host keys dir not found: {keys_dir}"));
+        }
+    } else {
+        // Default: copy installer's current host keys (preserved from rescue by kexec)
+        let copy_keys = "cp /etc/ssh/ssh_host_* /mnt/etc/ssh/ 2>/dev/null && \
+                          chmod 600 /mnt/etc/ssh/ssh_host_*_key && \
+                          chmod 644 /mnt/etc/ssh/ssh_host_*_key.pub";
+        if ssh_run_no_check(&cfg.host, copy_keys, v).is_ok() {
+            ok("host keys copied from installer");
+        } else {
+            warn("host key copy failed (server will generate new keys)");
+        }
+    }
 
     // ── reboot ────────────────────────────────────────────────────────────
     let _ = ssh_run_no_check(
