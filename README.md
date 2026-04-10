@@ -34,6 +34,33 @@ Then use the package:
 nix-remote-delivery = inputs.nix-remote-delivery.packages.${system}.default;
 ```
 
+Or use the overlay for a simpler package reference:
+```nix
+# flake.nix
+{
+  inputs.nix-remote-delivery.url = "github:onnimonni/nix-remote-delivery";
+
+  outputs = { self, nixpkgs, nix-remote-delivery, ... }: {
+    overlays.default = nix-remote-delivery.overlays.default;
+  };
+}
+```
+
+```nix
+# devenv.nix
+{ pkgs, ... }:
+{
+  packages = [
+    pkgs.nix-remote-delivery
+  ];
+}
+```
+
+You can also run the tool directly from the flake without adding it to `PATH`:
+```bash
+nix run github:onnimonni/nix-remote-delivery -- --help
+```
+
 ### With devenv
 
 ```yaml
