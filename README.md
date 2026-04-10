@@ -141,6 +141,7 @@ For provisioning a fresh server (any Linux → NixOS):
 - **Git-aware sync**: uses `git ls-files` to determine what to transfer. Respects `.gitignore` automatically.
 - **Commit-based sync skip**: after deploy, writes the git commit hash to the server. On next deploy, if the working tree is clean and the commit matches, skips sync.
 - **Build output filtering**: suppresses the hundreds of `/nix/store/...` derivation paths that `nixos-rebuild` dumps. Shows only actionable build progress.
+- **TTY-aware build output**: interactive terminals get the live rebuild stream, while non-interactive sessions stay quiet unless there is a warning, failure, or activation milestone worth surfacing.
 - **Error tail**: on build failure, shows the last 50 lines of output for diagnosis.
 - **Closure-diff cache push**: after activation, compares the new system closure with the pre-build one and only pushes paths that are genuinely new.
 
@@ -162,7 +163,7 @@ The `--cache` flag provides a persistent Nix binary cache backed by any SFTP-acc
 
 ### How it works
 
-1. **Mount**: SSHFS-mounts the Storage Box to `/mnt/nix-cache` using the server's own SSH key
+1. **Mount**: SSHFS-mounts the Storage Box to `/mnt/nix-cache` using the server's own SSH key. The tool retries transient mount failures automatically and prints the last SSHFS error if all attempts fail.
 2. **Substituter**: passes `--option extra-substituters 'file:///mnt/nix-cache'` to `nixos-rebuild` — nix fetches from cache only what it needs
 3. **Build**: anything not in cache is built normally (and pulled from `cache.nixos.org`)
 4. **Push**: diffs the system closure before/after build, pushes only new paths via `nix copy --to file:///mnt/nix-cache`
@@ -189,7 +190,7 @@ nix-remote-delivery my-server --flake . --cache user@user.your-storagebox.de
 
 ### Works with any SFTP storage
 
-The `--cache` flag accepts any `user@host` that supports SFTP on port 23. While designed for Hetzner Storage Boxes, it works with any SFTP server — just ensure the server's SSH key is authorized.
+The `--cache` flag accepts any `user@host` that supports SFTP. Port 23 is the default for Hetzner Storage Boxes; override it with `--cache-port` for other SSHFS/SFTP endpoints.
 
 ## Options
 
@@ -210,6 +211,7 @@ OPTIONS
     --skip-eval           Skip local nix eval entirely
     --force-eval          Force eval even if .nix files unchanged
     --cache <USER@HOST>   SFTP cache via SSHFS (e.g. u123@u123.storagebox.de)
+    --cache-port <PORT>   SSH port for --cache      [default: 23]
     --verbose, -v         Show commands and extra details
     --kexec-url <URL>     Custom kexec tarball URL (install mode only)
     -h, --help            Show this help

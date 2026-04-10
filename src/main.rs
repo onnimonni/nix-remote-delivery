@@ -1,5 +1,5 @@
 use std::env;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -56,6 +56,8 @@ struct Config {
     kexec_url: String,
     /// SFTP user@host for binary cache
     cache_url: Option<String>,
+    /// SSH port for the SFTP/SSHFS cache endpoint
+    cache_port: u16,
     /// SSH host keys source: directory path OR sops-encrypted YAML file
     /// Directory: --host-keys ./keys/ (contains ssh_host_*_key files)
     /// SOPS file: --host-keys secrets/hosts/server.yaml (decrypted on-the-fly)
@@ -63,12 +65,17 @@ struct Config {
 }
 
 const DEFAULT_KEXEC_URL: &str = "https://github.com/nix-community/nixos-images/releases/download/nixos-unstable/nixos-kexec-installer-noninteractive-x86_64-linux.tar.gz";
+const DEFAULT_CACHE_PORT: u16 = 23;
+const CACHE_MOUNT_RETRIES: usize = 3;
+const CACHE_MOUNT_RETRY_DELAY_MS: u64 = 1_500;
 
 fn usage() {
     eprintln!("{BOLD}nix-remote-delivery{RESET} — deploy or install NixOS, building on the server");
     eprintln!();
     eprintln!("{BOLD}USAGE{RESET}");
-    eprintln!("    nix-remote-delivery [NODE] [OPTIONS]            Deploy (eval → sync → build+activate)");
+    eprintln!(
+        "    nix-remote-delivery [NODE] [OPTIONS]            Deploy (eval → sync → build+activate)"
+    );
     eprintln!("    nix-remote-delivery install [NODE] [OPTIONS]    Initial install (kexec → disko → install)");
     eprintln!();
     eprintln!("{BOLD}ARGS{RESET}");
@@ -82,13 +89,23 @@ fn usage() {
     eprintln!("    --force-eval          Force eval even if .nix files unchanged");
     eprintln!("    --verbose, -v         Show commands and extra details");
     eprintln!("    --cache <USER@HOST>    SFTP cache via SSHFS (e.g. u123@u123.storagebox.de)");
-    eprintln!("    --host-keys <DIR>     Inject SSH host keys from DIR (install mode, persists identity)");
+    eprintln!("    --cache-port <PORT>   SSH port for --cache      [default: 23]");
+    eprintln!(
+        "    --host-keys <DIR>     Inject SSH host keys from DIR (install mode, persists identity)"
+    );
     eprintln!("    --kexec-url <URL>     Custom kexec tarball URL (install mode only)");
     eprintln!("    -h, --help            Show this help");
 }
 
 fn parse_args() -> Config {
-    let mut args = env::args().skip(1).peekable();
+    parse_args_from(env::args().skip(1))
+}
+
+fn parse_args_from<I>(iter: I) -> Config
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = iter.into_iter().peekable();
     let mut mode = Mode::Deploy;
     let mut node = String::from("stuffix-one");
     let mut host: Option<String> = None;
@@ -99,6 +116,7 @@ fn parse_args() -> Config {
     let mut verbose = false;
     let mut kexec_url = String::from(DEFAULT_KEXEC_URL);
     let mut cache_url: Option<String> = None;
+    let mut cache_port = DEFAULT_CACHE_PORT;
     let mut host_keys_dir: Option<String> = None;
 
     while let Some(arg) = args.next() {
@@ -131,6 +149,19 @@ fn parse_args() -> Config {
                     fail("--cache requires a value (user@host)");
                     std::process::exit(1);
                 }));
+            }
+            "--cache-port" => {
+                cache_port = args
+                    .next()
+                    .unwrap_or_else(|| {
+                        fail("--cache-port requires a value");
+                        std::process::exit(1);
+                    })
+                    .parse::<u16>()
+                    .unwrap_or_else(|_| {
+                        fail("--cache-port must be an integer between 1 and 65535");
+                        std::process::exit(1);
+                    });
             }
             "--host-keys" => {
                 host_keys_dir = Some(args.next().unwrap_or_else(|| {
@@ -167,6 +198,7 @@ fn parse_args() -> Config {
         verbose,
         kexec_url,
         cache_url,
+        cache_port,
         host_keys_dir,
     }
 }
@@ -332,6 +364,155 @@ fn ssh_output(host: &str, cmd: &str) -> Result<String, ()> {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .ok_or(())
+}
+
+/// Run SSH command and capture combined stdout/stderr for diagnostics.
+fn ssh_output_combined(host: &str, cmd: &str) -> Result<String, String> {
+    let mut args = ssh_base_args(host, true);
+    args.push(cmd.into());
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let out = Command::new("ssh")
+        .args(&refs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to exec ssh: {e}"))?;
+
+    let mut text = String::new();
+    text.push_str(&String::from_utf8_lossy(&out.stdout));
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let text = text.trim().to_string();
+
+    if out.status.success() {
+        Ok(text)
+    } else if text.is_empty() {
+        Err(format!(
+            "ssh exited with status {}",
+            out.status.code().unwrap_or(1)
+        ))
+    } else {
+        Err(text)
+    }
+}
+
+fn summarize_tail(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join(" | ")
+}
+
+fn is_noisy_build_line(trimmed: &str) -> bool {
+    if trimmed.starts_with("  /nix/store/") || trimmed.starts_with("/nix/store/") {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    lower.starts_with("these ")
+        || lower.starts_with("copying path ")
+        || lower.starts_with("warning: download buffer ")
+        || lower.starts_with("unpacking ")
+        || lower.starts_with("building ")
+        || lower.starts_with("installing ")
+        || lower.starts_with("waiting for children")
+        || lower.starts_with("evaluation warning:")
+}
+
+fn should_print_build_line(line: &str, interactive: bool, verbose: bool) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if verbose {
+        return !trimmed.starts_with("  /nix/store/") && !trimmed.starts_with("/nix/store/");
+    }
+
+    if interactive {
+        return !is_noisy_build_line(trimmed)
+            || trimmed.starts_with("building the system configuration");
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("warning:")
+        || lower.contains("activating")
+        || lower.contains("switching to system configuration")
+        || lower.contains("restarting the following units")
+        || lower.contains("starting the following units")
+        || lower.contains("stopping the following units")
+        || lower.contains("reloading the following units")
+        || lower.contains("the following new units were started")
+        || lower.contains("the following units were restarted")
+        || lower.contains("created symlink")
+        || lower.contains("setting up /etc")
+        || lower.contains("done. the new configuration is")
+    {
+        return true;
+    }
+
+    trimmed.starts_with("building the system configuration")
+}
+
+fn mount_remote_cache(
+    host: &str,
+    cache: &str,
+    cache_mount: &str,
+    cache_port: u16,
+    v: bool,
+) -> Result<(), String> {
+    let mount_cmd = format!(
+        "command -v sshfs >/dev/null && command -v fusermount >/dev/null && \
+         fusermount -u {cache_mount} 2>/dev/null; \
+         mkdir -p {cache_mount} && \
+         sshfs -p {cache_port} \
+           -o StrictHostKeyChecking=no,reconnect,ServerAliveInterval=15 \
+           -o IdentityFile=/etc/ssh/ssh_host_ed25519_key \
+           {cache}:./nix-cache {cache_mount} 2>&1"
+    );
+
+    let mut last_error = String::new();
+
+    for attempt in 1..=CACHE_MOUNT_RETRIES {
+        if attempt > 1 {
+            verbose(
+                v,
+                &format!(
+                    "retrying cache mount ({attempt}/{CACHE_MOUNT_RETRIES}) after previous failure"
+                ),
+            );
+            std::thread::sleep(Duration::from_millis(CACHE_MOUNT_RETRY_DELAY_MS));
+        }
+
+        match ssh_output_combined(host, &mount_cmd) {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = err,
+        }
+    }
+
+    let summary = summarize_tail(&last_error, 3);
+    if summary.is_empty() {
+        Err(format!(
+            "cache mount failed after {CACHE_MOUNT_RETRIES} attempts"
+        ))
+    } else {
+        Err(format!(
+            "cache mount failed after {CACHE_MOUNT_RETRIES} attempts: {summary}"
+        ))
+    }
 }
 
 /// Evaluate the NixOS config locally (no builds, no downloads).
@@ -546,9 +727,8 @@ fn sync_via_tar(host: &str, local_dir: &Path, remote_dir: &str, strict_host: boo
     let files = git_tracked_files(local_dir, v);
     let archive = create_tar_gz(local_dir, &files, v);
 
-    let extract_cmd = format!(
-        "rm -rf '{remote_dir}' && mkdir -p '{remote_dir}' && tar xzf - -C '{remote_dir}'"
-    );
+    let extract_cmd =
+        format!("rm -rf '{remote_dir}' && mkdir -p '{remote_dir}' && tar xzf - -C '{remote_dir}'");
 
     let mut args = ssh_base_args(host, strict_host);
     args.push(extract_cmd);
@@ -688,8 +868,7 @@ fn cmd_deploy(cfg: &Config) {
     let clean = git_is_clean(flake_path);
     let skip_sync = if clean {
         if let Some(ref rev) = local_rev {
-            remote_deploy_rev(&cfg.host, &cfg.remote_path)
-                .map_or(false, |remote| &remote == rev)
+            remote_deploy_rev(&cfg.host, &cfg.remote_path).map_or(false, |remote| &remote == rev)
         } else {
             false
         }
@@ -736,10 +915,7 @@ fn cmd_deploy(cfg: &Config) {
             Ok(()) => {
                 save_eval_cache(flake_path, &cfg.node);
                 if skip_sync {
-                    eprintln!(
-                        "\r  {GREEN}✓{RESET} eval  {:.1}s",
-                        eval_t.as_secs_f32()
-                    );
+                    eprintln!("\r  {GREEN}✓{RESET} eval  {:.1}s", eval_t.as_secs_f32());
                 } else {
                     eprintln!(
                         "\r  {GREEN}✓{RESET} eval+sync  {sync_count} files  {:.1}s (eval {:.1}s, sync {sync_time:.1}s)",
@@ -756,31 +932,33 @@ fn cmd_deploy(cfg: &Config) {
             }
         }
     } else if !skip_sync && sync_count > 0 {
-        eprintln!(
-            "\r  {GREEN}✓{RESET} sync  {sync_count} files  {sync_time:.1}s",
-        );
+        eprintln!("\r  {GREEN}✓{RESET} sync  {sync_count} files  {sync_time:.1}s",);
     }
 
     // ── mount cache if --cache is set ───────────────────────────────────
     // SSHFS mount using server's own SSH key (set up during initial server config)
     let cache_mount = "/mnt/nix-cache";
     let cache_mounted = if let Some(ref cache) = cfg.cache_url {
-        verbose(v, &format!("mounting cache: {cache} → {cache_mount}"));
-        let mount_cmd = format!(
-            "fusermount -u {cache_mount} 2>/dev/null; \
-             mkdir -p {cache_mount} && \
-             sshfs -p 23 \
-               -o StrictHostKeyChecking=no,reconnect,ServerAliveInterval=15 \
-               -o IdentityFile=/etc/ssh/ssh_host_ed25519_key \
-               {cache}:./nix-cache {cache_mount} 2>&1"
+        verbose(
+            v,
+            &format!(
+                "mounting cache: {cache} → {cache_mount} (port {})",
+                cfg.cache_port
+            ),
         );
-        ssh_run(&cfg.host, &mount_cmd, v).is_ok()
+        match mount_remote_cache(&cfg.host, cache, cache_mount, cfg.cache_port, v) {
+            Ok(()) => true,
+            Err(err) => {
+                warn(&err);
+                false
+            }
+        }
     } else {
         false
     };
 
     if cfg.cache_url.is_some() && !cache_mounted {
-        warn("cache mount failed (building without cache)");
+        warn("building without cache");
     }
 
     // ── save pre-build closure on server for diff ─────────────────────────
@@ -816,18 +994,21 @@ fn cmd_deploy(cfg: &Config) {
     let build_refs: Vec<&str> = build_args.iter().map(|s| s.as_str()).collect();
 
     let t = Instant::now();
+    let interactive_stderr = std::io::stderr().is_terminal();
 
     let result = run_streaming("ssh", &build_refs, &|line| {
-        if line.starts_with("  /nix/store/") || line.starts_with("/nix/store/") {
-            return;
+        if should_print_build_line(line, interactive_stderr, v) {
+            eprintln!("    {}", line.trim());
         }
-        eprintln!("    {line}");
     });
 
     match result {
         Ok(()) => {
             ok(&format!("activated  {:.1}s", t.elapsed().as_secs_f32()));
-            if let Ok(gen) = ssh_output(&cfg.host, "nixos-rebuild list-generations 2>/dev/null | tail -1") {
+            if let Ok(gen) = ssh_output(
+                &cfg.host,
+                "nixos-rebuild list-generations 2>/dev/null | tail -1",
+            ) {
                 if !gen.is_empty() {
                     verbose(v, &format!("generation: {gen}"));
                 }
@@ -872,7 +1053,11 @@ fn cmd_deploy(cfg: &Config) {
             Err(_) => {
                 eprintln!();
                 warn("cache push failed (non-fatal)");
-                let _ = ssh_run(&cfg.host, &format!("fusermount -u {cache_mount} 2>/dev/null; true"), false);
+                let _ = ssh_run(
+                    &cfg.host,
+                    &format!("fusermount -u {cache_mount} 2>/dev/null; true"),
+                    false,
+                );
             }
         }
     }
@@ -1060,7 +1245,11 @@ fn cmd_install(cfg: &Config) {
             let mut injected = 0;
             for (field, filename, mode) in [
                 ("ssh_host_ed25519_key", "ssh_host_ed25519_key", "0600"),
-                ("ssh_host_ed25519_key_pub", "ssh_host_ed25519_key.pub", "0644"),
+                (
+                    "ssh_host_ed25519_key_pub",
+                    "ssh_host_ed25519_key.pub",
+                    "0644",
+                ),
                 ("ssh_host_rsa_key", "ssh_host_rsa_key", "0600"),
                 ("ssh_host_rsa_key_pub", "ssh_host_rsa_key.pub", "0644"),
             ] {
@@ -1255,7 +1444,10 @@ mod tests {
     fn run_streaming_captures_tail() {
         let result = run_streaming(
             "sh",
-            &["-c", "for i in $(seq 1 100); do echo line$i >&2; done; exit 1"],
+            &[
+                "-c",
+                "for i in $(seq 1 100); do echo line$i >&2; done; exit 1",
+            ],
             &|_| {},
         );
         match result {
@@ -1271,7 +1463,10 @@ mod tests {
     fn git_tracked_files_works_in_repo() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let files = git_tracked_files(&dir, false);
-        let names: Vec<String> = files.iter().map(|f| f.to_string_lossy().to_string()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.to_string_lossy().to_string())
+            .collect();
         assert!(
             names.contains(&"Cargo.toml".to_string()),
             "Cargo.toml not found in {names:?}"
@@ -1311,5 +1506,66 @@ mod tests {
         // being unchanged between calls, which they are in tests
 
         let _ = fs::remove_file(&cache);
+    }
+
+    #[test]
+    fn parse_args_supports_cache_port() {
+        let cfg = parse_args_from([
+            "demo-node".to_string(),
+            "--cache".to_string(),
+            "user@example.test".to_string(),
+            "--cache-port".to_string(),
+            "2222".to_string(),
+        ]);
+
+        assert_eq!(cfg.node, "demo-node");
+        assert_eq!(cfg.cache_url.as_deref(), Some("user@example.test"));
+        assert_eq!(cfg.cache_port, 2222);
+    }
+
+    #[test]
+    fn parse_args_uses_default_cache_port() {
+        let cfg = parse_args_from(["demo-node".to_string()]);
+        assert_eq!(cfg.cache_port, DEFAULT_CACHE_PORT);
+    }
+
+    #[test]
+    fn summarize_tail_keeps_last_lines() {
+        let text = "first\nsecond\nthird\nfourth\n";
+        assert_eq!(summarize_tail(text, 2), "third | fourth");
+    }
+
+    #[test]
+    fn non_interactive_build_output_keeps_only_high_signal_lines() {
+        assert!(should_print_build_line(
+            "building the system configuration...",
+            false,
+            false
+        ));
+        assert!(should_print_build_line(
+            "activating the configuration...",
+            false,
+            false
+        ));
+        assert!(!should_print_build_line(
+            "copying path '/nix/store/foo' from 'https://cache.nixos.org'",
+            false,
+            false
+        ));
+        assert!(!should_print_build_line(
+            "these 12 derivations will be built:",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn verbose_mode_still_hides_store_paths_only() {
+        assert!(should_print_build_line(
+            "copying path '/nix/store/foo' from 'https://cache.nixos.org'",
+            true,
+            true
+        ));
+        assert!(!should_print_build_line("/nix/store/abc.drv", true, true));
     }
 }
