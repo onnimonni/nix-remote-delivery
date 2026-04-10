@@ -16,17 +16,18 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        package = pkgs.rustPlatform.buildRustPackage {
+          pname = "nix-remote-delivery";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          doCheck = true;
+        };
       in
       {
-        packages = {
-          default = pkgs.rustPlatform.buildRustPackage {
-            pname = "nix-remote-delivery";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            doCheck = false;
-          };
-        };
+        packages.default = package;
+        checks.default = package;
+        formatter = pkgs.nixfmt;
       }
     );
 }
