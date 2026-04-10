@@ -326,19 +326,6 @@ fn ssh_run(host: &str, cmd: &str, v: bool) -> Result<(), i32> {
     run("ssh", &refs)
 }
 
-/// Run ssh command on remote host with agent forwarding (for cache access).
-fn ssh_run_agent(host: &str, cmd: &str, v: bool) -> Result<(), i32> {
-    verbose(v, &format!("ssh -A root@{host} {cmd}"));
-    let mut args = ssh_base_args(host, true);
-    // Insert -A before root@host (which is last)
-    let user_host = args.pop().unwrap();
-    args.push("-A".into());
-    args.push(user_host);
-    args.push(cmd.into());
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run("ssh", &refs)
-}
-
 /// Run ssh command, accepting new host keys (for after kexec).
 fn ssh_run_no_check(host: &str, cmd: &str, v: bool) -> Result<(), i32> {
     verbose(v, &format!("ssh root@{host} {cmd}"));
@@ -544,6 +531,7 @@ fn nix_eval(flake: &str, node: &str, v: bool) -> Result<(), String> {
 
 // ── Eval cache ────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -657,9 +645,7 @@ fn git_is_clean(dir: &Path) -> bool {
         .stderr(Stdio::null())
         .output()
         .ok()
-        .map_or(false, |o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty()
-        })
+        .is_some_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty())
 }
 
 /// Check remote deploy marker to see if sync can be skipped.
@@ -697,10 +683,8 @@ fn create_tar_gz(base_dir: &Path, files: &[PathBuf], v: bool) -> Vec<u8> {
 
         for rel in files {
             let full = base_dir.join(rel);
-            if full.is_file() {
-                if tar.append_path_with_name(&full, rel).is_ok() {
-                    count += 1;
-                }
+            if full.is_file() && tar.append_path_with_name(&full, rel).is_ok() {
+                count += 1;
             }
         }
 
@@ -866,15 +850,10 @@ fn cmd_deploy(cfg: &Config) {
 
     let local_rev = git_rev(flake_path);
     let clean = git_is_clean(flake_path);
-    let skip_sync = if clean {
-        if let Some(ref rev) = local_rev {
-            remote_deploy_rev(&cfg.host, &cfg.remote_path).map_or(false, |remote| &remote == rev)
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let skip_sync = clean
+        && local_rev.as_ref().is_some_and(|rev| {
+            remote_deploy_rev(&cfg.host, &cfg.remote_path).is_some_and(|remote| &remote == rev)
+        });
 
     // ── Run eval + sync in parallel ───────────────────────────────────────
     let eval_handle = if do_eval {
@@ -1345,6 +1324,36 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn git_is_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn init_temp_git_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+
+        if git_is_available() {
+            let status = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git init failed");
+        }
+
+        dir
+    }
+
     #[test]
     fn sha256_known_value() {
         assert_eq!(
@@ -1461,7 +1470,14 @@ mod tests {
 
     #[test]
     fn git_tracked_files_works_in_repo() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if !git_is_available() {
+            return;
+        }
+
+        let dir = init_temp_git_repo("nix-remote-delivery-test-git-files");
+        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+
         let files = git_tracked_files(&dir, false);
         let names: Vec<String> = files
             .iter()
@@ -1475,20 +1491,28 @@ mod tests {
             names.contains(&"src/main.rs".to_string()),
             "src/main.rs not found in {names:?}"
         );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn nix_files_hash_deterministic() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        if !git_is_available() {
+            return;
+        }
+
+        let dir = init_temp_git_repo("nix-remote-delivery-test-nix-hash");
+        fs::write(dir.join("flake.nix"), "{ }\n").unwrap();
+        fs::write(dir.join("module.nix"), "{ pkgs }: pkgs\n").unwrap();
+        fs::write(dir.join("flake.lock"), "{ }\n").unwrap();
+        fs::write(dir.join("README.md"), "ignore me\n").unwrap();
+
         let h1 = nix_files_hash(&dir);
         let h2 = nix_files_hash(&dir);
         assert_eq!(h1, h2);
         assert!(!h1.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
