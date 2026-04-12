@@ -68,6 +68,7 @@ const DEFAULT_KEXEC_URL: &str = "https://github.com/nix-community/nixos-images/r
 const DEFAULT_CACHE_PORT: u16 = 23;
 const CACHE_MOUNT_RETRIES: usize = 3;
 const CACHE_MOUNT_RETRY_DELAY_MS: u64 = 1_500;
+const SSH_CONTROL_DIR_ENV: &str = "NIX_REMOTE_DELIVERY_SSH_CONTROL_DIR";
 
 fn usage() {
     eprintln!("{BOLD}nix-remote-delivery{RESET} — deploy or install NixOS, building on the server");
@@ -95,6 +96,12 @@ fn usage() {
     );
     eprintln!("    --kexec-url <URL>     Custom kexec tarball URL (install mode only)");
     eprintln!("    -h, --help            Show this help");
+    eprintln!();
+    eprintln!("{BOLD}ENVIRONMENT{RESET}");
+    eprintln!(
+        "    {SSH_CONTROL_DIR_ENV}   Directory for SSH ControlPath sockets [default: system temp dir]"
+    );
+    eprintln!("    TMPDIR                              Base temp dir for other local temp files");
 }
 
 fn parse_args() -> Config {
@@ -290,10 +297,30 @@ fn run_streaming(
 }
 
 /// Build SSH args with ControlMaster multiplexing, keepalive, optional host key bypass.
+fn ssh_control_dir() -> PathBuf {
+    env::var_os(SSH_CONTROL_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+}
+
+fn ssh_control_path_from_dir(base_dir: &Path, host: &str) -> PathBuf {
+    base_dir.join(format!("nix-remote-delivery-{host}"))
+}
+
+fn ssh_control_path(host: &str) -> PathBuf {
+    let base_dir = ssh_control_dir();
+    ssh_control_path_from_dir(&base_dir, host)
+}
+
 fn ssh_base_args(host: &str, strict_host: bool) -> Vec<String> {
+    let control_path = ssh_control_path(host);
+    if let Some(parent) = control_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     let mut args = vec![
         "-o".into(),
-        format!("ControlPath=/tmp/nix-remote-delivery-{host}"),
+        format!("ControlPath={}", control_path.display()),
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
@@ -567,7 +594,7 @@ fn nix_files_hash(flake_dir: &Path) -> String {
 }
 
 fn eval_cache_path(node: &str) -> PathBuf {
-    PathBuf::from(format!("/tmp/nix-remote-delivery-eval-{node}.hash"))
+    env::temp_dir().join(format!("nix-remote-delivery-eval-{node}.hash"))
 }
 
 fn should_skip_eval(flake_dir: &Path, node: &str) -> bool {
@@ -1421,6 +1448,12 @@ mod tests {
         assert!(args.contains(&"ControlMaster=auto".to_string()));
         assert!(args.contains(&"Compression=yes".to_string()));
         assert!(args.contains(&"root@myhost".to_string()));
+        assert!(args.iter().any(|arg| {
+            arg == &format!(
+                "ControlPath={}",
+                env::temp_dir().join("nix-remote-delivery-myhost").display()
+            )
+        }));
         assert!(!args.contains(&"StrictHostKeyChecking=no".to_string()));
     }
 
@@ -1429,6 +1462,15 @@ mod tests {
         let args = ssh_base_args("myhost", false);
         assert!(args.contains(&"StrictHostKeyChecking=no".to_string()));
         assert!(args.contains(&"ControlMaster=auto".to_string()));
+    }
+
+    #[test]
+    fn ssh_control_path_from_dir_uses_override_dir() {
+        let path = ssh_control_path_from_dir(Path::new("/var/run/demo"), "myhost");
+        assert_eq!(
+            path,
+            PathBuf::from("/var/run/demo").join("nix-remote-delivery-myhost")
+        );
     }
 
     #[test]
@@ -1530,6 +1572,14 @@ mod tests {
         // being unchanged between calls, which they are in tests
 
         let _ = fs::remove_file(&cache);
+    }
+
+    #[test]
+    fn eval_cache_path_uses_system_temp_dir() {
+        assert_eq!(
+            eval_cache_path("demo-node"),
+            env::temp_dir().join("nix-remote-delivery-eval-demo-node.hash")
+        );
     }
 
     #[test]

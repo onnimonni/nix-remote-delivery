@@ -113,6 +113,10 @@ nix-remote-delivery my-server --flake . --skip-eval
 # Verbose output (shows SSH commands, file lists, timing)
 nix-remote-delivery my-server --flake . -v
 
+# Override the SSH control socket directory when /tmp is unavailable
+NIX_REMOTE_DELIVERY_SSH_CONTROL_DIR="$PWD/.nrd-sockets" \
+  nix-remote-delivery my-server --host 1.2.3.4 --flake .
+
 # Initial install on a fresh server (kexec → disko → nixos-install)
 nix-remote-delivery install my-server --host 1.2.3.4 --flake .
 ```
@@ -242,6 +246,10 @@ OPTIONS
     --verbose, -v         Show commands and extra details
     --kexec-url <URL>     Custom kexec tarball URL (install mode only)
     -h, --help            Show this help
+
+ENVIRONMENT
+    NIX_REMOTE_DELIVERY_SSH_CONTROL_DIR  Directory for SSH ControlPath sockets [default: system temp dir]
+    TMPDIR                              Base temp dir for other local temp files
 ```
 
 ## Requirements
