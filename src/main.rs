@@ -481,6 +481,23 @@ fn should_print_build_line(line: &str, interactive: bool, verbose: bool) -> bool
     trimmed.starts_with("building the system configuration")
 }
 
+fn diagnose_cache_error(err: &str) -> &'static str {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("connection reset by peer") || lower.contains("broken pipe") {
+        "SFTP connection dropped — storagebox may be overloaded, will retry"
+    } else if lower.contains("no such file") || lower.contains("not found") {
+        "sshfs or fusermount missing on server — add pkgs.sshfs to system packages"
+    } else if lower.contains("permission denied") || lower.contains("publickey") {
+        "SSH key not authorized on storage box — check authorized_keys"
+    } else if lower.contains("network unreachable") || lower.contains("no route") {
+        "storage box unreachable — check firewall/network"
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "storage box connection timed out — check if port 23 is open"
+    } else {
+        ""
+    }
+}
+
 fn mount_remote_cache(
     host: &str,
     cache: &str,
@@ -517,14 +534,23 @@ fn mount_remote_cache(
         }
     }
 
+    let hint = diagnose_cache_error(&last_error);
     let summary = summarize_tail(&last_error, 3);
-    if summary.is_empty() {
+    let detail = if !hint.is_empty() {
+        hint.to_string()
+    } else if !summary.is_empty() {
+        summary
+    } else {
+        String::new()
+    };
+
+    if detail.is_empty() {
         Err(format!(
             "cache mount failed after {CACHE_MOUNT_RETRIES} attempts"
         ))
     } else {
         Err(format!(
-            "cache mount failed after {CACHE_MOUNT_RETRIES} attempts: {summary}"
+            "cache mount failed after {CACHE_MOUNT_RETRIES} attempts: {detail}"
         ))
     }
 }
@@ -940,6 +966,7 @@ fn cmd_deploy(cfg: &Config) {
     } else if !skip_sync && sync_count > 0 {
         eprintln!("\r  {GREEN}✓{RESET} sync  {sync_count} files  {sync_time:.1}s",);
     }
+    let eval_sync_elapsed = t0.elapsed().as_secs_f32();
 
     // ── mount cache if --cache is set ───────────────────────────────────
     // SSHFS mount using server's own SSH key (set up during initial server config)
@@ -1001,16 +1028,37 @@ fn cmd_deploy(cfg: &Config) {
 
     let t = Instant::now();
     let interactive_stderr = std::io::stderr().is_terminal();
+    let build_pkg_count = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    let build_pkg_count2 = build_pkg_count.clone();
 
     let result = run_streaming("ssh", &build_refs, &|line| {
+        // Count derivations to build from lines like "these 42 derivations will be built:"
+        let trimmed = line.trim();
+        if trimmed.starts_with("these ") && trimmed.contains("derivation") {
+            if let Some(n) = trimmed
+                .strip_prefix("these ")
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                *build_pkg_count2.lock().unwrap() = n;
+            }
+        }
         if should_print_build_line(line, interactive_stderr, v) {
-            eprintln!("    {}", line.trim());
+            eprintln!("    {}", trimmed);
         }
     });
 
+    let build_pkgs = *build_pkg_count.lock().unwrap();
+    let build_elapsed = t.elapsed().as_secs_f32();
+
     match result {
         Ok(()) => {
-            ok(&format!("activated  {:.1}s", t.elapsed().as_secs_f32()));
+            let pkg_info = if build_pkgs > 0 {
+                format!(" ({build_pkgs} pkgs built)")
+            } else {
+                String::new()
+            };
+            ok(&format!("activated{pkg_info}  {build_elapsed:.1}s"));
             if let Ok(gen) = ssh_output(
                 &cfg.host,
                 "nixos-rebuild list-generations 2>/dev/null | tail -1",
@@ -1068,10 +1116,15 @@ fn cmd_deploy(cfg: &Config) {
         }
     }
 
+    let total = t0.elapsed().as_secs_f32();
+    let build_phase = build_elapsed;
+    // eval+sync ran in parallel; their elapsed = eval_sync_elapsed - anything before t0
+    let phases = format!(
+        "eval+sync {eval_sync_elapsed:.0}s | build {build_phase:.0}s"
+    );
     eprintln!(
-        "\n{GREEN}{BOLD}✓{RESET} deployed {BOLD}{}{RESET}  total {:.0}s\n",
-        cfg.node,
-        t0.elapsed().as_secs_f32()
+        "\n{GREEN}{BOLD}✓{RESET} deployed {BOLD}{}{RESET}  {phases}  total {total:.0}s\n",
+        cfg.node
     );
 }
 
